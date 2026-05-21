@@ -1,23 +1,22 @@
 """
-roster.py
+src/roster.py
 
-Construye dos tablas nuevas para el proyecto NBA Next-Man-Up:
+Construye las tablas de roster y perfiles para NBA Next-Man-Up.
 
-1. latest_roster.csv
-   Roster más reciente disponible en la base de datos.
-   No representa necesariamente el roster actual real de la NBA.
+Tablas generadas:
+- latest_roster.csv: último equipo conocido por jugador en toda la base histórica.
+- player_season_profiles.csv: una fila por jugador-temporada.
+- player_profiles.csv: una fila por jugador con estadísticas ponderadas por recencia.
+- app_roster.csv: roster usable por la app, solo la temporada más reciente global.
 
-2. player_profiles.csv
-   Perfil histórico agregado por jugador usando todas sus filas disponibles,
-   sin importar equipo ni temporada.
-
-Regla conceptual:
-- latest_team sirve para decidir en qué roster aparece el jugador.
-- player profile sirve para calcular similitud, impacto y recomendación.
+Idea central:
+- app_roster decide quién puede aparecer en la interfaz y en la banca.
+- player_profiles calcula similitud, impacto y ranking usando perfil histórico ponderado.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -29,20 +28,19 @@ except ImportError:
     from role_features import prepare_players_data
 
 
-# ---------------------------------------------------------------------
-# Columnas y constantes
-# ---------------------------------------------------------------------
+UNKNOWN_POSITION_VALUES = {"", "UNK", "UNKNOWN", "NAN", "NONE", "NA", "N/A", "0"}
 
-UNKNOWN_POSITION_VALUES = {
-    "",
-    "UNK",
-    "UNKNOWN",
-    "NAN",
-    "NONE",
-    "NA",
-    "N/A",
-    "0",
-}
+LATEST_ROSTER_COLUMNS = [
+    "player_id",
+    "player_name",
+    "latest_team_id",
+    "latest_team",
+    "latest_season",
+    "latest_game_date",
+    "latest_game_id",
+    "latest_position",
+    "latest_has_minutes",
+]
 
 PLAYER_PROFILE_BASE_COLUMNS = [
     "player_id",
@@ -75,30 +73,43 @@ PLAYER_PROFILE_BASE_COLUMNS = [
     "versatility",
 ]
 
-LATEST_ROSTER_COLUMNS = [
-    "player_id",
-    "player_name",
-    "latest_team_id",
-    "latest_team",
-    "latest_season",
-    "latest_game_date",
-    "latest_game_id",
-    "latest_position",
-    "latest_has_minutes",
+RECENCY_PROFILE_COLUMNS = [
+    "recent_season",
+    "recent_minutes",
+    "previous_season",
+    "previous_minutes",
+    "activity_score",
+    "low_activity_flag",
+    "trend_score",
+    "recent_impact_per36",
+    "previous_impact_per36",
+    "recency_weighted_minutes_total",
+]
+
+METRIC_COLUMNS = [
+    "minutes",
+    "points",
+    "assists",
+    "rebounds",
+    "steals",
+    "blocks",
+    "turnovers",
+    "three_attempts",
+    "usage_rate",
+    "offensive_rating",
+    "defensive_rating",
+    "pace",
+    "plus_minus",
 ]
 
 
 # ---------------------------------------------------------------------
-# Helpers generales
+# Limpieza y helpers
 # ---------------------------------------------------------------------
 
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza nombres de columnas a snake_case y aplica alias usados por el dataset NBA.
-    """
     df = df.copy()
-
     df.columns = (
         df.columns.str.strip()
         .str.lower()
@@ -119,6 +130,7 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         "pts": "points",
         "ast": "assists",
         "reb": "rebounds",
+        "trb": "rebounds",
         "stl": "steals",
         "blk": "blocks",
         "to": "turnovers",
@@ -130,187 +142,145 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         "fg_pct_pct": "fg_pct",
         "three_pct_pct": "three_pct",
     }
-
     return df.rename(columns=rename_map)
 
 
-
 def clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Limpia espacios en columnas de texto sin convertir NaN en texto."""
     df = df.copy()
-
     for col in df.select_dtypes(include=["object"]).columns:
-        df[col] = df[col].apply(
-            lambda value: value.strip() if isinstance(value, str) else value
-        )
-
+        df[col] = df[col].apply(lambda value: value.strip() if isinstance(value, str) else value)
     return df
 
 
-
 def parse_minutes_value(value) -> float:
-    """
-    Convierte minutos tipo '12:34' a minutos decimales.
-    Valores vacíos, DNP o inválidos se vuelven 0.0.
-    """
     if pd.isna(value):
         return 0.0
-
     if isinstance(value, (int, float)):
-        if np.isfinite(value):
-            return float(value)
-        return 0.0
-
+        return float(value) if np.isfinite(value) else 0.0
     value = str(value).strip()
-
     if value == "":
         return 0.0
-
     if ":" in value:
         try:
             minutes, seconds = value.split(":")[:2]
             return float(minutes) + float(seconds) / 60.0
         except ValueError:
             return 0.0
-
     try:
         number = float(value)
     except ValueError:
         return 0.0
-
     return number if np.isfinite(number) else 0.0
 
 
-
 def normalize_position_label(value) -> str:
-    """
-    Normaliza posiciones a grupos simples: G, F, C o UNK.
-    """
     if pd.isna(value):
         return "UNK"
-
-    position = str(value).strip().upper()
-
-    if position in UNKNOWN_POSITION_VALUES:
+    pos = str(value).strip().upper().replace(" ", "").replace("_", "-")
+    if pos in UNKNOWN_POSITION_VALUES:
         return "UNK"
-
-    position = position.replace(" ", "").replace("_", "-")
-
-    if position in ["PG", "SG", "G", "GUARD"]:
+    if pos in ["PG", "SG", "G", "GUARD"]:
         return "G"
-
-    if position in ["SF", "PF", "F", "FORWARD"]:
+    if pos in ["SF", "PF", "F", "FORWARD"]:
         return "F"
-
-    if position in ["C", "CENTER"]:
+    if pos in ["C", "CENTER"]:
         return "C"
-
-    if position in ["G-F", "F-G"]:
+    if pos in ["G-F", "F-G"]:
         return "F"
-
-    if position in ["F-C", "C-F"]:
+    if pos in ["F-C", "C-F"]:
         return "F"
-
-    if "C" in position and "G" not in position:
+    if "C" in pos and "G" not in pos:
         return "C"
-
-    if "G" in position and "C" not in position:
+    if "G" in pos and "C" not in pos:
         return "G"
-
-    if "F" in position:
+    if "F" in pos:
         return "F"
-
     return "UNK"
 
 
-
 def get_mode_text(series: pd.Series, default_value: str = "UNK") -> str:
-    """Devuelve el texto más frecuente ignorando valores vacíos."""
     cleaned = series.dropna().astype(str).str.strip()
     cleaned = cleaned[~cleaned.str.upper().isin(UNKNOWN_POSITION_VALUES)]
-
     if cleaned.empty:
         return default_value
-
     return str(cleaned.mode().iloc[0])
 
 
-
 def get_latest_text(series: pd.Series, default_value: str = "") -> str:
-    """Devuelve el último texto no vacío de una serie ordenada temporalmente."""
     cleaned = series.dropna().astype(str).str.strip()
     cleaned = cleaned[cleaned != ""]
-
     if cleaned.empty:
         return default_value
-
     return str(cleaned.iloc[-1])
 
 
-
 def safe_divide(numerator, denominator, default: float = 0.0) -> float:
-    """Divide evitando NaN, infinitos y división entre cero."""
     try:
         numerator = float(numerator)
         denominator = float(denominator)
     except (TypeError, ValueError):
         return default
-
     if denominator == 0 or not np.isfinite(numerator) or not np.isfinite(denominator):
         return default
-
     result = numerator / denominator
-
     return float(result) if np.isfinite(result) else default
 
 
-
 def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
-    """Devuelve la primera columna existente dentro de una lista."""
     for col in candidates:
         if col in df.columns:
             return col
-
     return None
 
 
+def _ensure_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for col in columns:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return df
+
+
+def _weighted_mean(values: pd.Series, weights: pd.Series, default: float = 0.0) -> float:
+    values = pd.to_numeric(values, errors="coerce")
+    weights = pd.to_numeric(weights, errors="coerce")
+    mask = values.notna() & weights.notna() & (weights > 0)
+    if not mask.any():
+        return default
+    return float(np.average(values[mask], weights=weights[mask]))
+
+
+def _weighted_ratio(numerators: pd.Series, denominators: pd.Series, weights: pd.Series, default: float = 0.0) -> float:
+    numerators = pd.to_numeric(numerators, errors="coerce").fillna(0.0)
+    denominators = pd.to_numeric(denominators, errors="coerce").fillna(0.0)
+    weights = pd.to_numeric(weights, errors="coerce").fillna(0.0)
+    den = float((denominators * weights).sum())
+    if den <= 0:
+        return default
+    return float((numerators * weights).sum() / den)
+
 
 def build_team_id_to_abbreviation_map(teams_df: Optional[pd.DataFrame]) -> dict[int, str]:
-    """Construye un diccionario team_id -> abreviatura/nombre si teams_df está disponible."""
     if teams_df is None or teams_df.empty:
         return {}
-
-    teams = clean_column_names(teams_df)
-    teams = clean_text_columns(teams)
-
+    teams = clean_text_columns(clean_column_names(teams_df))
     if "team_id" not in teams.columns:
         return {}
-
     label_col = first_existing_column(teams, ["team", "nickname", "city"])
-
     if label_col is None:
         return {}
-
     mapping: dict[int, str] = {}
-
     for _, row in teams.iterrows():
         team_id = pd.to_numeric(row.get("team_id"), errors="coerce")
-
-        if pd.isna(team_id):
-            continue
-
         label = row.get(label_col)
-
-        if pd.isna(label):
-            continue
-
-        mapping[int(team_id)] = str(label).strip()
-
+        if pd.notna(team_id) and pd.notna(label):
+            mapping[int(team_id)] = str(label).strip()
     return mapping
 
 
 # ---------------------------------------------------------------------
-# Preparación base desde games_details + games
+# Base por jugador-partido
 # ---------------------------------------------------------------------
 
 
@@ -319,25 +289,15 @@ def prepare_player_game_rows(
     games_df: pd.DataFrame,
     teams_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """
-    Une games_details.csv con games.csv por game_id y deja una fila por jugador-partido.
-
-    Esta función es la base tanto para latest_roster como para player_profiles.
-    """
-    details = clean_column_names(games_details_df)
-    games = clean_column_names(games_df)
-    details = clean_text_columns(details)
-    games = clean_text_columns(games)
+    details = clean_text_columns(clean_column_names(games_details_df))
+    games = clean_text_columns(clean_column_names(games_df))
 
     required_detail_columns = ["game_id", "player_id", "player_name", "team_id"]
     required_game_columns = ["game_id", "game_date"]
-
     missing_detail = [col for col in required_detail_columns if col not in details.columns]
     missing_game = [col for col in required_game_columns if col not in games.columns]
-
     if missing_detail:
         raise ValueError(f"games_details.csv no tiene columnas requeridas: {missing_detail}")
-
     if missing_game:
         raise ValueError(f"games.csv no tiene columnas requeridas: {missing_game}")
 
@@ -350,43 +310,35 @@ def prepare_player_game_rows(
 
     if "position" not in details.columns:
         details["position"] = "UNK"
-
     if "minutes" not in details.columns:
         details["minutes"] = 0.0
 
     details["minutes"] = details["minutes"].apply(parse_minutes_value)
     details["has_minutes"] = details["minutes"] > 0
-
     details["position"] = details["position"].apply(normalize_position_label)
 
     games_columns = ["game_id", "game_date"]
-
     if "season" in games.columns:
         games_columns.append("season")
-
     games_lookup = games[games_columns].drop_duplicates(subset=["game_id"])
 
     merged = details.merge(games_lookup, on="game_id", how="left")
-
     merged["game_date"] = pd.to_datetime(merged["game_date"], errors="coerce")
-
     merged["game_id_numeric"] = pd.to_numeric(merged["game_id"], errors="coerce")
     merged["player_id"] = pd.to_numeric(merged["player_id"], errors="coerce")
     merged["team_id"] = pd.to_numeric(merged["team_id"], errors="coerce")
 
     if "season" not in merged.columns:
         merged["season"] = merged["game_date"].dt.year
-
     merged["season"] = pd.to_numeric(merged["season"], errors="coerce")
 
-    merged = merged.dropna(subset=["player_id", "game_id", "team_id"])
+    merged = merged.dropna(subset=["player_id", "game_id", "team_id", "season"])
     merged = merged[merged["team"].notna()].copy()
     merged["team"] = merged["team"].astype(str).str.strip()
     merged = merged[merged["team"] != ""].copy()
-
     merged["player_id"] = merged["player_id"].astype(int)
     merged["team_id"] = merged["team_id"].astype(int)
-
+    merged["season"] = merged["season"].astype(int)
     return merged.reset_index(drop=True)
 
 
@@ -400,21 +352,7 @@ def build_latest_roster(
     games_df: pd.DataFrame,
     teams_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """
-    Construye el roster más reciente disponible en la base.
-
-    Reglas:
-    - Fuente: games_details.csv unido con games.csv por game_id.
-    - Criterio principal: game_date.
-    - Empate: game_id y prioridad a filas con minutos reales.
-    - Salida: una fila por player_id.
-    """
-    rows = prepare_player_game_rows(
-        games_details_df=games_details_df,
-        games_df=games_df,
-        teams_df=teams_df,
-    )
-
+    rows = prepare_player_game_rows(games_details_df, games_df, teams_df)
     if rows.empty:
         raise ValueError("No hay filas válidas para construir latest_roster.csv.")
 
@@ -425,15 +363,12 @@ def build_latest_roster(
         .to_dict()
     )
 
-    sort_columns = ["player_id", "game_date", "game_id_numeric", "has_minutes"]
     rows = rows.sort_values(
-        sort_columns,
+        ["player_id", "game_date", "game_id_numeric", "has_minutes"],
         ascending=[True, True, True, True],
         na_position="first",
     )
-
     latest = rows.drop_duplicates(subset=["player_id"], keep="last").copy()
-
     latest["latest_position"] = latest.apply(
         lambda row: row["position"]
         if normalize_position_label(row.get("position", "UNK")) != "UNK"
@@ -441,234 +376,102 @@ def build_latest_roster(
         axis=1,
     )
 
-    latest["latest_game_date"] = latest["game_date"].dt.strftime("%Y-%m-%d")
-    latest["latest_season"] = pd.to_numeric(latest["season"], errors="coerce")
-    latest["latest_game_id"] = pd.to_numeric(latest["game_id"], errors="coerce")
-
     latest_roster = pd.DataFrame(
         {
             "player_id": latest["player_id"].astype(int),
             "player_name": latest["player_name"].astype(str).str.strip(),
             "latest_team_id": latest["team_id"].astype(int),
             "latest_team": latest["team"].astype(str).str.strip(),
-            "latest_season": latest["latest_season"].astype("Int64"),
-            "latest_game_date": latest["latest_game_date"],
-            "latest_game_id": latest["latest_game_id"].astype("Int64"),
+            "latest_season": pd.to_numeric(latest["season"], errors="coerce").astype("Int64"),
+            "latest_game_date": latest["game_date"].dt.strftime("%Y-%m-%d"),
+            "latest_game_id": pd.to_numeric(latest["game_id"], errors="coerce").astype("Int64"),
             "latest_position": latest["latest_position"].apply(normalize_position_label),
             "latest_has_minutes": latest["has_minutes"].astype(bool),
         }
     )
-
     latest_roster = latest_roster.dropna(subset=["latest_team", "latest_game_date"])
     latest_roster = latest_roster[latest_roster["latest_team"].astype(str).str.strip() != ""]
     latest_roster = latest_roster.sort_values("player_name").reset_index(drop=True)
-
     return latest_roster[LATEST_ROSTER_COLUMNS]
 
 
 # ---------------------------------------------------------------------
-# player_profiles.csv
+# player_season_profiles.csv
 # ---------------------------------------------------------------------
 
 
-def _ensure_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """Crea columnas faltantes y convierte a numérico."""
-    df = df.copy()
-
-    for col in columns:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    return df
-
-
-
-def _infer_position_from_profile(row: pd.Series) -> str:
-    """Infiere posición si no hay una posición confiable en START_POSITION."""
-    current = normalize_position_label(row.get("position", "UNK"))
-
-    if current != "UNK":
-        return current
-
-    minutes = float(row.get("minutes", 0.0) or 0.0)
-
-    if minutes <= 0:
-        return "F"
-
-    factor = 36.0 / minutes
-
-    assists_per36 = float(row.get("assists", 0.0) or 0.0) * factor
-    rebounds_per36 = float(row.get("rebounds", 0.0) or 0.0) * factor
-    blocks_per36 = float(row.get("blocks", 0.0) or 0.0) * factor
-    three_attempts_per36 = float(row.get("three_attempts", 0.0) or 0.0) * factor
-
-    if rebounds_per36 >= 9.0 or blocks_per36 >= 1.4:
-        return "C"
-
-    if assists_per36 >= 5.0 and rebounds_per36 <= 6.5 and blocks_per36 <= 0.8:
-        return "G"
-
-    if (
-        assists_per36 >= 3.5
-        and three_attempts_per36 >= 4.0
-        and rebounds_per36 <= 5.5
-        and blocks_per36 <= 0.7
-    ):
-        return "G"
-
-    return "F"
-
-
-
 def _build_team_possessions(player_game_rows: pd.DataFrame) -> pd.DataFrame:
-    """Calcula posesiones aproximadas por equipo-partido desde box score."""
-    needed = ["fga", "fta", "oreb", "turnovers"]
-    rows = _ensure_numeric_columns(player_game_rows, needed)
-
+    rows = _ensure_numeric_columns(player_game_rows, ["fga", "fta", "oreb", "turnovers"])
     team_game = rows.groupby(["game_id", "team_id"], as_index=False).agg(
         team_fga=("fga", "sum"),
         team_fta=("fta", "sum"),
         team_oreb=("oreb", "sum"),
         team_turnovers=("turnovers", "sum"),
     )
-
     team_game["team_possessions"] = (
-        team_game["team_fga"]
-        + 0.44 * team_game["team_fta"]
-        - team_game["team_oreb"]
-        + team_game["team_turnovers"]
+        team_game["team_fga"] + 0.44 * team_game["team_fta"] - team_game["team_oreb"] + team_game["team_turnovers"]
     )
-
     team_game.loc[team_game["team_possessions"] <= 0, "team_possessions"] = np.nan
-
     median_possessions = team_game["team_possessions"].median(skipna=True)
-
     if pd.isna(median_possessions):
         median_possessions = 100.0
-
-    team_game["team_possessions"] = team_game["team_possessions"].fillna(
-        median_possessions
-    )
-
+    team_game["team_possessions"] = team_game["team_possessions"].fillna(median_possessions)
     return team_game[["game_id", "team_id", "team_possessions"]]
 
 
-
-def build_player_profiles(
+def build_player_season_profiles(
     games_details_df: pd.DataFrame,
     games_df: pd.DataFrame,
     teams_df: Optional[pd.DataFrame] = None,
-    latest_roster_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """
-    Construye player_profiles.csv con una fila por player_id usando todo el historial.
-
-    Las métricas principales son consistentes con el recomendador actual:
-    - games_played = partidos con minutos reales.
-    - minutes, points, assists, etc. = promedio por partido jugado.
-    - fg_pct = FGM total / FGA total.
-    - three_pct = FG3M total / FG3A total.
-    - usage_rate = uso agregado sobre posesiones del equipo en partidos jugados.
-    """
-    rows = prepare_player_game_rows(
-        games_details_df=games_details_df,
-        games_df=games_df,
-        teams_df=teams_df,
-    )
-
+    rows = prepare_player_game_rows(games_details_df, games_df, teams_df)
     if rows.empty:
-        raise ValueError("No hay filas válidas para construir player_profiles.csv.")
+        raise ValueError("No hay filas válidas para construir player_season_profiles.csv.")
 
     numeric_columns = [
-        "minutes",
-        "points",
-        "assists",
-        "rebounds",
-        "steals",
-        "blocks",
-        "turnovers",
-        "fgm",
-        "fga",
-        "three_made",
-        "three_attempts",
-        "ftm",
-        "fta",
-        "oreb",
-        "dreb",
-        "plus_minus",
+        "minutes", "points", "assists", "rebounds", "steals", "blocks", "turnovers",
+        "fgm", "fga", "three_made", "three_attempts", "ftm", "fta", "oreb", "dreb", "plus_minus",
     ]
-
     rows = _ensure_numeric_columns(rows, numeric_columns)
-
     team_possessions = _build_team_possessions(rows)
     rows = rows.merge(team_possessions, on=["game_id", "team_id"], how="left")
 
-    median_possessions = rows["team_possessions"].median(skipna=True)
-    if pd.isna(median_possessions):
-        median_possessions = 100.0
+    played = rows[rows["minutes"] > 0].copy()
+    if played.empty:
+        raise ValueError("No hay filas con minutos reales para construir perfiles por temporada.")
 
-    rows["team_possessions"] = rows["team_possessions"].fillna(median_possessions)
-
-    # Solo las apariciones con minutos reales alimentan el perfil estadístico.
-    played_rows = rows[rows["minutes"] > 0].copy()
-
-    if played_rows.empty:
-        raise ValueError(
-            "No se encontraron filas con minutos reales para construir player_profiles.csv."
-        )
-
-    played_rows["fg_pct_row"] = np.where(
-        played_rows["fga"] > 0,
-        played_rows["fgm"] / played_rows["fga"],
+    played["usage_numerator"] = played["fga"] + 0.44 * played["fta"] + played["turnovers"]
+    played["fg_pct_row"] = np.where(played["fga"] > 0, played["fgm"] / played["fga"], 0.0)
+    played["three_pct_row"] = np.where(
+        played["three_attempts"] > 0,
+        played["three_made"] / played["three_attempts"],
         0.0,
     )
-
-    played_rows["three_pct_row"] = np.where(
-        played_rows["three_attempts"] > 0,
-        played_rows["three_made"] / played_rows["three_attempts"],
-        0.0,
-    )
-
-    usage_numerator = (
-        played_rows["fga"] + 0.44 * played_rows["fta"] + played_rows["turnovers"]
-    )
-
-    played_rows["usage_numerator"] = usage_numerator
-
-    played_rows["offensive_rating_row"] = (
+    played["offensive_rating_row"] = (
         100
-        + 1.2 * played_rows["points"]
-        + 0.8 * played_rows["assists"]
-        - 1.5 * played_rows["turnovers"]
-        + 8.0 * played_rows["fg_pct_row"]
-        + 6.0 * played_rows["three_pct_row"]
+        + 1.2 * played["points"]
+        + 0.8 * played["assists"]
+        - 1.5 * played["turnovers"]
+        + 8.0 * played["fg_pct_row"]
+        + 6.0 * played["three_pct_row"]
     )
-
-    played_rows["defensive_rating_row"] = (
+    played["defensive_rating_row"] = (
         115
-        - 1.5 * played_rows["steals"]
-        - 1.3 * played_rows["blocks"]
-        - 0.4 * played_rows["rebounds"]
-        - 0.15 * played_rows["plus_minus"]
+        - 1.5 * played["steals"]
+        - 1.3 * played["blocks"]
+        - 0.4 * played["rebounds"]
+        - 0.15 * played["plus_minus"]
     )
 
-    played_rows = played_rows.sort_values(
-        by=["player_id", "game_date", "game_id_numeric"],
-        ascending=[True, True, True],
-        na_position="first",
-    )
+    played = played.sort_values(["player_id", "season", "game_date", "game_id_numeric"])
 
-    position_lookup = (
-        played_rows[played_rows["position"] != "UNK"]
-        .groupby("player_id")["position"]
-        .agg(lambda values: get_mode_text(values, default_value="UNK"))
-        .to_dict()
-    )
-
-    grouped = played_rows.groupby("player_id", as_index=False).agg(
+    grouped = played.groupby(["player_id", "season"], as_index=False).agg(
         player_name=("player_name", lambda values: get_latest_text(values, "")),
+        team_id=("team_id", lambda values: int(pd.Series(values).mode().iloc[0])),
+        team=("team", lambda values: get_latest_text(values, "")),
+        position=("position", lambda values: get_mode_text(values, "UNK")),
         games_played=("game_id", "nunique"),
+        season_minutes_total=("minutes", "sum"),
         minutes=("minutes", "mean"),
         points=("points", "mean"),
         assists=("assists", "mean"),
@@ -689,115 +492,235 @@ def build_player_profiles(
         plus_minus=("plus_minus", "mean"),
     )
 
-    grouped["position"] = grouped["player_id"].map(position_lookup).fillna("UNK")
+    grouped["fg_pct"] = grouped.apply(lambda r: safe_divide(r["fgm_total"], r["fga_total"]), axis=1)
+    grouped["three_pct"] = grouped.apply(lambda r: safe_divide(r["three_made_total"], r["three_attempts_total"]), axis=1)
+    grouped["usage_rate"] = grouped.apply(lambda r: safe_divide(r["usage_numerator_total"], r["team_possessions_total"]), axis=1)
+    grouped["usage_rate"] = grouped["usage_rate"].clip(0, 1)
 
-    grouped["fg_pct"] = grouped.apply(
-        lambda row: safe_divide(row["fgm_total"], row["fga_total"], default=0.0),
-        axis=1,
+    simple_impact = (
+        grouped["points"]
+        + 0.7 * grouped["rebounds"]
+        + 0.7 * grouped["assists"]
+        + 1.5 * grouped["steals"]
+        + 1.5 * grouped["blocks"]
+        - grouped["turnovers"]
     )
-
-    grouped["three_pct"] = grouped.apply(
-        lambda row: safe_divide(
-            row["three_made_total"], row["three_attempts_total"], default=0.0
-        ),
-        axis=1,
+    grouped["impact_per36"] = np.where(
+        grouped["minutes"] > 0,
+        simple_impact / grouped["minutes"] * 36.0,
+        0.0,
     )
-
-    grouped["usage_rate"] = grouped.apply(
-        lambda row: safe_divide(
-            row["usage_numerator_total"],
-            row["team_possessions_total"],
-            default=0.0,
-        ),
-        axis=1,
-    )
-
-    grouped["usage_rate"] = grouped["usage_rate"].clip(lower=0, upper=1)
-
-    if latest_roster_df is None:
-        latest_roster_df = build_latest_roster(
-            games_details_df=games_details_df,
-            games_df=games_df,
-            teams_df=teams_df,
-        )
-
-    latest = latest_roster_df.copy()
-
-    if not latest.empty:
-        latest["player_id"] = pd.to_numeric(latest["player_id"], errors="coerce")
-        latest = latest.dropna(subset=["player_id"]).copy()
-        latest["player_id"] = latest["player_id"].astype(int)
-
-        grouped = grouped.merge(
-            latest[
-                [
-                    "player_id",
-                    "latest_team_id",
-                    "latest_team",
-                    "latest_season",
-                    "latest_game_date",
-                    "latest_game_id",
-                    "latest_position",
-                ]
-            ],
-            on="player_id",
-            how="left",
-        )
-    else:
-        grouped["latest_team_id"] = np.nan
-        grouped["latest_team"] = ""
-        grouped["latest_season"] = np.nan
-        grouped["latest_game_date"] = ""
-        grouped["latest_game_id"] = np.nan
-        grouped["latest_position"] = "UNK"
-
-    # Compatibilidad con el recomendador actual:
-    # team/team_id representan el equipo más reciente disponible en la base.
-    grouped["team_id"] = pd.to_numeric(
-        grouped["latest_team_id"], errors="coerce"
-    ).fillna(0).astype(int)
-    grouped["team"] = grouped["latest_team"].fillna("").astype(str)
-
-    grouped["position"] = grouped.apply(_infer_position_from_profile, axis=1)
-
-    grouped = prepare_players_data(grouped, overwrite_roles=True)
-
-    for col in PLAYER_PROFILE_BASE_COLUMNS:
-        if col not in grouped.columns:
-            grouped[col] = 0.0 if col not in ["player_name", "team", "position"] else ""
-
-    metadata_columns = [
-        "latest_team_id",
-        "latest_team",
-        "latest_season",
-        "latest_game_date",
-        "latest_game_id",
-        "latest_position",
-    ]
-
-    ordered_columns = PLAYER_PROFILE_BASE_COLUMNS + metadata_columns
-
-    grouped = grouped[ordered_columns].copy()
-
-    numeric_columns_to_clean = [
-        col
-        for col in grouped.columns
-        if col not in ["player_name", "team", "position", "latest_team", "latest_game_date", "latest_position"]
-    ]
-
-    for col in numeric_columns_to_clean:
-        grouped[col] = pd.to_numeric(grouped[col], errors="coerce")
 
     grouped["player_id"] = grouped["player_id"].astype(int)
-    grouped["games_played"] = grouped["games_played"].astype(int)
+    grouped["season"] = grouped["season"].astype(int)
+    grouped["position"] = grouped["position"].apply(normalize_position_label)
 
-    grouped = grouped.sort_values("player_name").reset_index(drop=True)
-
-    return grouped
+    return grouped.sort_values(["player_name", "season"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------
-# Función conveniente para guardar ambos CSV
+# player_profiles.csv ponderado por recencia
+# ---------------------------------------------------------------------
+
+
+def _infer_position_from_profile(row: pd.Series) -> str:
+    current = normalize_position_label(row.get("position", "UNK"))
+    if current != "UNK":
+        return current
+    minutes = float(row.get("minutes", 0.0) or 0.0)
+    if minutes <= 0:
+        return "F"
+    factor = 36.0 / minutes
+    assists_per36 = float(row.get("assists", 0.0) or 0.0) * factor
+    rebounds_per36 = float(row.get("rebounds", 0.0) or 0.0) * factor
+    blocks_per36 = float(row.get("blocks", 0.0) or 0.0) * factor
+    three_attempts_per36 = float(row.get("three_attempts", 0.0) or 0.0) * factor
+    if rebounds_per36 >= 9.0 or blocks_per36 >= 1.4:
+        return "C"
+    if assists_per36 >= 5.0 and rebounds_per36 <= 6.5 and blocks_per36 <= 0.8:
+        return "G"
+    if assists_per36 >= 3.5 and three_attempts_per36 >= 4.0 and rebounds_per36 <= 5.5 and blocks_per36 <= 0.7:
+        return "G"
+    return "F"
+
+
+def build_player_profiles(
+    games_details_df: pd.DataFrame,
+    games_df: pd.DataFrame,
+    teams_df: Optional[pd.DataFrame] = None,
+    latest_roster_df: Optional[pd.DataFrame] = None,
+    player_season_profiles_df: Optional[pd.DataFrame] = None,
+    lambda_decay: float = 0.65,
+    activity_reference_minutes: float = 800.0,
+    min_recent_minutes_warning: float = 200.0,
+) -> pd.DataFrame:
+    if player_season_profiles_df is None:
+        season_profiles = build_player_season_profiles(games_details_df, games_df, teams_df)
+    else:
+        season_profiles = player_season_profiles_df.copy()
+
+    if latest_roster_df is None:
+        latest_roster_df = build_latest_roster(games_details_df, games_df, teams_df)
+
+    if season_profiles.empty:
+        raise ValueError("No hay perfiles por temporada para construir player_profiles.csv.")
+
+    global_latest_season = int(pd.to_numeric(season_profiles["season"], errors="coerce").max())
+    season_profiles["season_gap"] = global_latest_season - pd.to_numeric(season_profiles["season"], errors="coerce")
+    season_profiles["season_weight"] = np.exp(-float(lambda_decay) * season_profiles["season_gap"].clip(lower=0))
+    season_profiles["recency_weight"] = season_profiles["season_weight"] * np.sqrt(
+        pd.to_numeric(season_profiles["season_minutes_total"], errors="coerce").fillna(0).clip(lower=0)
+    )
+    # Si un jugador tiene muy pocos minutos en todas sus temporadas, evitamos peso cero.
+    season_profiles.loc[season_profiles["recency_weight"] <= 0, "recency_weight"] = 1e-6
+
+    output_rows: list[dict] = []
+
+    for player_id, group in season_profiles.groupby("player_id"):
+        group = group.sort_values("season")
+        latest_row = group.iloc[-1]
+        previous_row = group.iloc[-2] if len(group) >= 2 else None
+        weights = group["recency_weight"]
+
+        profile: dict = {
+            "player_id": int(player_id),
+            "player_name": get_latest_text(group["player_name"], ""),
+            "games_played": int(group["games_played"].sum()),
+            "position": get_mode_text(group["position"], "UNK"),
+            "recent_season": int(latest_row["season"]),
+            "recent_minutes": float(latest_row["season_minutes_total"]),
+            "previous_season": int(previous_row["season"]) if previous_row is not None else np.nan,
+            "previous_minutes": float(previous_row["season_minutes_total"]) if previous_row is not None else 0.0,
+            "recent_impact_per36": float(latest_row.get("impact_per36", 0.0)),
+            "previous_impact_per36": float(previous_row.get("impact_per36", 0.0)) if previous_row is not None else 0.0,
+        }
+
+        for metric in METRIC_COLUMNS:
+            profile[metric] = _weighted_mean(group[metric], weights, default=0.0)
+
+        profile["fg_pct"] = _weighted_ratio(group["fgm_total"], group["fga_total"], weights, default=0.0)
+        profile["three_pct"] = _weighted_ratio(
+            group["three_made_total"], group["three_attempts_total"], weights, default=0.0
+        )
+
+        profile["activity_score"] = float(np.clip(profile["recent_minutes"] / activity_reference_minutes, 0.0, 1.0))
+        profile["low_activity_flag"] = bool(profile["recent_minutes"] < min_recent_minutes_warning)
+
+        if previous_row is None or float(previous_row.get("season_minutes_total", 0.0)) <= 0:
+            trend_score = 0.0
+        else:
+            previous_impact = float(previous_row.get("impact_per36", 0.0))
+            recent_impact = float(latest_row.get("impact_per36", 0.0))
+            trend = (recent_impact - previous_impact) / (abs(previous_impact) + 1e-6)
+            trend_score = float(np.clip(trend, -0.25, 0.25))
+        profile["trend_score"] = trend_score
+        profile["recency_weighted_minutes_total"] = float((group["season_minutes_total"] * weights).sum())
+
+        output_rows.append(profile)
+
+    profiles = pd.DataFrame(output_rows)
+
+    latest = latest_roster_df.copy()
+    latest["player_id"] = pd.to_numeric(latest["player_id"], errors="coerce")
+    latest = latest.dropna(subset=["player_id"]).copy()
+    latest["player_id"] = latest["player_id"].astype(int)
+
+    profiles = profiles.merge(
+        latest[
+            [
+                "player_id", "latest_team_id", "latest_team", "latest_season",
+                "latest_game_date", "latest_game_id", "latest_position",
+            ]
+        ],
+        on="player_id",
+        how="left",
+    )
+
+    profiles["team_id"] = pd.to_numeric(profiles["latest_team_id"], errors="coerce").fillna(0).astype(int)
+    profiles["team"] = profiles["latest_team"].fillna("").astype(str)
+    profiles["position"] = profiles.apply(_infer_position_from_profile, axis=1)
+
+    profiles = prepare_players_data(profiles, overwrite_roles=True)
+
+    for col in PLAYER_PROFILE_BASE_COLUMNS + RECENCY_PROFILE_COLUMNS:
+        if col not in profiles.columns:
+            if col in ["player_name", "team", "position"]:
+                profiles[col] = ""
+            elif col == "low_activity_flag":
+                profiles[col] = False
+            else:
+                profiles[col] = 0.0
+
+    metadata_columns = [
+        "latest_team_id", "latest_team", "latest_season", "latest_game_date", "latest_game_id", "latest_position",
+    ]
+    ordered_columns = PLAYER_PROFILE_BASE_COLUMNS + metadata_columns + RECENCY_PROFILE_COLUMNS
+    profiles = profiles[ordered_columns].copy()
+
+    numeric_exclusions = {"player_name", "team", "position", "latest_team", "latest_game_date", "latest_position", "low_activity_flag"}
+    for col in profiles.columns:
+        if col not in numeric_exclusions:
+            profiles[col] = pd.to_numeric(profiles[col], errors="coerce")
+
+    profiles["player_id"] = profiles["player_id"].astype(int)
+    profiles["games_played"] = profiles["games_played"].fillna(0).astype(int)
+    profiles["low_activity_flag"] = profiles["low_activity_flag"].astype(bool)
+
+    return profiles.sort_values("player_name").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------
+# app_roster.csv
+# ---------------------------------------------------------------------
+
+
+def build_app_roster(
+    latest_roster_df: pd.DataFrame,
+    player_profiles_df: pd.DataFrame,
+    latest_season: Optional[int] = None,
+) -> pd.DataFrame:
+    latest = latest_roster_df.copy()
+    profiles = player_profiles_df.copy()
+
+    latest["latest_season"] = pd.to_numeric(latest["latest_season"], errors="coerce")
+    if latest_season is None:
+        latest_season = int(latest["latest_season"].max())
+
+    latest = latest[latest["latest_season"] == int(latest_season)].copy()
+    latest["player_id"] = pd.to_numeric(latest["player_id"], errors="coerce")
+    profiles["player_id"] = pd.to_numeric(profiles["player_id"], errors="coerce")
+    latest = latest.dropna(subset=["player_id"]).copy()
+    profiles = profiles.dropna(subset=["player_id"]).copy()
+    latest["player_id"] = latest["player_id"].astype(int)
+    profiles["player_id"] = profiles["player_id"].astype(int)
+
+    profile_cols = [
+        "player_id", "position", "games_played", "minutes", "points",
+        "activity_score", "recent_minutes", "trend_score", "low_activity_flag",
+    ]
+    available_profile_cols = [col for col in profile_cols if col in profiles.columns]
+
+    app_roster = latest.merge(profiles[available_profile_cols], on="player_id", how="inner")
+    app_roster["position"] = app_roster["position"].apply(normalize_position_label)
+
+    ordered = [
+        "player_id", "player_name", "latest_team_id", "latest_team", "latest_season",
+        "latest_game_date", "latest_game_id", "position", "latest_position", "latest_has_minutes",
+        "games_played", "minutes", "points", "activity_score", "recent_minutes", "trend_score", "low_activity_flag",
+    ]
+    for col in ordered:
+        if col not in app_roster.columns:
+            app_roster[col] = np.nan
+
+    app_roster = app_roster.sort_values(
+        ["latest_team", "games_played", "minutes", "points"],
+        ascending=[True, False, False, False],
+    )
+    return app_roster[ordered].drop_duplicates(subset=["player_id"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------
+# Guardado conveniente
 # ---------------------------------------------------------------------
 
 
@@ -807,24 +730,36 @@ def build_and_save_roster_outputs(
     teams_df: Optional[pd.DataFrame],
     latest_roster_path,
     player_profiles_path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Construye y guarda latest_roster.csv y player_profiles.csv.
-    """
-    latest_roster_df = build_latest_roster(
-        games_details_df=games_details_df,
-        games_df=games_df,
-        teams_df=teams_df,
-    )
-
+    app_roster_path=None,
+    player_season_profiles_path=None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    latest_roster_df = build_latest_roster(games_details_df, games_df, teams_df)
+    player_season_profiles_df = build_player_season_profiles(games_details_df, games_df, teams_df)
     player_profiles_df = build_player_profiles(
         games_details_df=games_details_df,
         games_df=games_df,
         teams_df=teams_df,
         latest_roster_df=latest_roster_df,
+        player_season_profiles_df=player_season_profiles_df,
     )
+    app_roster_df = build_app_roster(latest_roster_df, player_profiles_df)
+
+    latest_roster_path = Path(latest_roster_path)
+    player_profiles_path = Path(player_profiles_path)
+    latest_roster_path.parent.mkdir(parents=True, exist_ok=True)
+    player_profiles_path.parent.mkdir(parents=True, exist_ok=True)
 
     latest_roster_df.to_csv(latest_roster_path, index=False)
     player_profiles_df.to_csv(player_profiles_path, index=False)
 
-    return latest_roster_df, player_profiles_df
+    if app_roster_path is not None:
+        app_roster_path = Path(app_roster_path)
+        app_roster_path.parent.mkdir(parents=True, exist_ok=True)
+        app_roster_df.to_csv(app_roster_path, index=False)
+
+    if player_season_profiles_path is not None:
+        player_season_profiles_path = Path(player_season_profiles_path)
+        player_season_profiles_path.parent.mkdir(parents=True, exist_ok=True)
+        player_season_profiles_df.to_csv(player_season_profiles_path, index=False)
+
+    return latest_roster_df, player_profiles_df, app_roster_df

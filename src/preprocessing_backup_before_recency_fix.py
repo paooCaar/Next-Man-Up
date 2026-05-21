@@ -24,6 +24,8 @@ Archivos generados:
 - data/processed/processed_players.csv
 - data/processed/processed_teams.csv
 - data/processed/processed_matchups.csv
+- data/processed/latest_roster.csv
+- data/processed/player_profiles.csv
 """
 
 from pathlib import Path
@@ -33,7 +35,7 @@ import numpy as np
 import pandas as pd
 
 try:
-    from src.roster import build_and_save_roster_outputs
+    from .roster import build_and_save_roster_outputs
 except ImportError:
     from roster import build_and_save_roster_outputs
 
@@ -57,8 +59,6 @@ PROCESSED_TEAMS_PATH = PROCESSED_DATA_DIR / "processed_teams.csv"
 PROCESSED_MATCHUPS_PATH = PROCESSED_DATA_DIR / "processed_matchups.csv"
 LATEST_ROSTER_PATH = PROCESSED_DATA_DIR / "latest_roster.csv"
 PLAYER_PROFILES_PATH = PROCESSED_DATA_DIR / "player_profiles.csv"
-APP_ROSTER_PATH = PROCESSED_DATA_DIR / "app_roster.csv"
-PLAYER_SEASON_PROFILES_PATH = PROCESSED_DATA_DIR / "player_season_profiles.csv"
 
 
 # ---------------------------------------------------------------------
@@ -1447,18 +1447,12 @@ def run_preprocessing() -> None:
         teams_df=teams_df,
     )
 
-    # Nuevas tablas para la lógica de roster y recencia.
-    # latest_roster.csv: último equipo conocido por jugador en toda la base.
-    # player_profiles.csv: perfil histórico ponderado por recencia.
-    # app_roster.csv: roster usable de la temporada más reciente disponible.
-    latest_roster_df, player_profiles_df, app_roster_df = build_and_save_roster_outputs(
+    latest_roster_df, player_profiles_df = build_and_save_roster_outputs(
         games_details_df=games_details_df,
         games_df=games_df,
         teams_df=teams_df,
         latest_roster_path=LATEST_ROSTER_PATH,
         player_profiles_path=PLAYER_PROFILES_PATH,
-        app_roster_path=APP_ROSTER_PATH,
-        player_season_profiles_path=PLAYER_SEASON_PROFILES_PATH,
     )
 
     processed_players_df.to_csv(PROCESSED_PLAYERS_PATH, index=False)
@@ -1469,18 +1463,15 @@ def run_preprocessing() -> None:
     print(f"Jugadores procesados: {len(processed_players_df)}")
     print(f"Equipos procesados: {len(processed_teams_df)}")
     print(f"Matchups procesados: {len(processed_matchups_df)}")
-    print(f"Latest roster: {len(latest_roster_df)}")
-    print(f"Perfiles históricos ponderados: {len(player_profiles_df)}")
-    print(f"App roster: {len(app_roster_df)}")
+    print(f"Jugadores en roster más reciente disponible: {len(latest_roster_df)}")
+    print(f"Perfiles históricos de jugador: {len(player_profiles_df)}")
 
     print("\nArchivos generados:")
     print(f"- {PROCESSED_PLAYERS_PATH}")
     print(f"- {PROCESSED_TEAMS_PATH}")
     print(f"- {PROCESSED_MATCHUPS_PATH}")
     print(f"- {LATEST_ROSTER_PATH}")
-    print(f"- {PLAYER_SEASON_PROFILES_PATH}")
     print(f"- {PLAYER_PROFILES_PATH}")
-    print(f"- {APP_ROSTER_PATH}")
 
 
 # ---------------------------------------------------------------------

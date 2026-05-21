@@ -155,6 +155,11 @@ def print_recommendations(result: dict) -> None:
                 "minutes": round(float(rec.get("minutes", 0)), 2),
                 "points": round(float(rec.get("points", 0)), 2),
                 "replacement_score": round(float(rec.get("replacement_score", 0)), 3),
+                "recommendation_score": round(float(rec.get("recommendation_score", 0)), 3),
+                "activity_score": round(float(rec.get("activity_score", 0)), 3),
+                "trend_score": round(float(rec.get("trend_score", 0)), 3),
+                "recent_minutes": round(float(rec.get("recent_minutes", 0)), 1),
+                "low_activity": bool(rec.get("low_activity_flag", False)),
                 "estimated_net_impact": round(float(rec.get("estimated_net_impact", 0)), 3),
                 "win_probability": round(float(rec.get("win_probability_with_replacement", 0)), 3),
             }
