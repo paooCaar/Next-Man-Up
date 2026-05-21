@@ -24,6 +24,8 @@ Archivos generados:
 - data/processed/processed_players.csv
 - data/processed/processed_teams.csv
 - data/processed/processed_matchups.csv
+- data/processed/latest_roster.csv
+- data/processed/player_profiles.csv
 """
 
 from pathlib import Path
@@ -31,6 +33,11 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+try:
+    from .roster import build_and_save_roster_outputs
+except ImportError:
+    from roster import build_and_save_roster_outputs
 
 
 # ---------------------------------------------------------------------
@@ -50,6 +57,8 @@ RAW_GAME_DETAILS_PATH = RAW_DATA_DIR / "games_details.csv"
 PROCESSED_PLAYERS_PATH = PROCESSED_DATA_DIR / "processed_players.csv"
 PROCESSED_TEAMS_PATH = PROCESSED_DATA_DIR / "processed_teams.csv"
 PROCESSED_MATCHUPS_PATH = PROCESSED_DATA_DIR / "processed_matchups.csv"
+LATEST_ROSTER_PATH = PROCESSED_DATA_DIR / "latest_roster.csv"
+PLAYER_PROFILES_PATH = PROCESSED_DATA_DIR / "player_profiles.csv"
 
 
 # ---------------------------------------------------------------------
@@ -1438,6 +1447,14 @@ def run_preprocessing() -> None:
         teams_df=teams_df,
     )
 
+    latest_roster_df, player_profiles_df = build_and_save_roster_outputs(
+        games_details_df=games_details_df,
+        games_df=games_df,
+        teams_df=teams_df,
+        latest_roster_path=LATEST_ROSTER_PATH,
+        player_profiles_path=PLAYER_PROFILES_PATH,
+    )
+
     processed_players_df.to_csv(PROCESSED_PLAYERS_PATH, index=False)
     processed_teams_df.to_csv(PROCESSED_TEAMS_PATH, index=False)
     processed_matchups_df.to_csv(PROCESSED_MATCHUPS_PATH, index=False)
@@ -1446,11 +1463,15 @@ def run_preprocessing() -> None:
     print(f"Jugadores procesados: {len(processed_players_df)}")
     print(f"Equipos procesados: {len(processed_teams_df)}")
     print(f"Matchups procesados: {len(processed_matchups_df)}")
+    print(f"Jugadores en roster más reciente disponible: {len(latest_roster_df)}")
+    print(f"Perfiles históricos de jugador: {len(player_profiles_df)}")
 
     print("\nArchivos generados:")
     print(f"- {PROCESSED_PLAYERS_PATH}")
     print(f"- {PROCESSED_TEAMS_PATH}")
     print(f"- {PROCESSED_MATCHUPS_PATH}")
+    print(f"- {LATEST_ROSTER_PATH}")
+    print(f"- {PLAYER_PROFILES_PATH}")
 
 
 # ---------------------------------------------------------------------

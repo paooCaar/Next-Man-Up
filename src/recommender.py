@@ -23,7 +23,7 @@ except ImportError:
 
 
 # ============================================================
-# 1. CONTRATO REAL DE DATOS PROCESADOS
+# 1. CONTRATO DE DATOS PROCESADOS PARA RECOMENDACIÓN
 # ============================================================
 
 PLAYER_REQUIRED_COLUMNS = [
@@ -54,6 +54,20 @@ PLAYER_REQUIRED_COLUMNS = [
     "rebounding",
     "spacing",
     "versatility",
+]
+
+PLAYER_PROFILE_REQUIRED_COLUMNS = PLAYER_REQUIRED_COLUMNS.copy()
+
+APP_ROSTER_REQUIRED_COLUMNS = [
+    "player_id",
+    "player_name",
+    "latest_team_id",
+    "latest_team",
+    "latest_season",
+    "latest_game_date",
+    "position",
+    "games_played",
+    "minutes",
 ]
 
 TEAM_REQUIRED_COLUMNS = [
@@ -97,7 +111,18 @@ PLAYER_NUMERIC_COLUMNS = [
     "defense",
     "rebounding",
     "spacing",
+    "rim_pressure",
     "versatility",
+]
+
+APP_ROSTER_NUMERIC_COLUMNS = [
+    "player_id",
+    "latest_team_id",
+    "latest_season",
+    "latest_game_id",
+    "games_played",
+    "minutes",
+    "points",
 ]
 
 TEAM_NUMERIC_COLUMNS = [
@@ -158,9 +183,7 @@ NBA_TEAM_ALIASES = {
 
 
 def _normalize_text(value: Any) -> str:
-    """
-    Normaliza texto para comparar equipos y jugadores.
-    """
+    """Normaliza texto para comparar equipos y jugadores."""
     if pd.isna(value):
         return ""
 
@@ -168,9 +191,7 @@ def _normalize_text(value: Any) -> str:
 
 
 def _team_aliases(value: Any) -> set[str]:
-    """
-    Devuelve posibles textos equivalentes para buscar un equipo.
-    """
+    """Devuelve textos equivalentes para buscar un equipo."""
     value_norm = _normalize_text(value)
     aliases = {value_norm}
 
@@ -186,9 +207,7 @@ def _team_aliases(value: Any) -> set[str]:
 
 
 def _to_dict(row: pd.Series | dict) -> dict:
-    """
-    Convierte una fila de pandas a diccionario plano.
-    """
+    """Convierte una fila de pandas a diccionario plano."""
     if isinstance(row, pd.Series):
         return row.to_dict()
 
@@ -196,9 +215,7 @@ def _to_dict(row: pd.Series | dict) -> dict:
 
 
 def _to_list(value: Any) -> list:
-    """
-    Convierte arrays o series a listas serializables.
-    """
+    """Convierte arrays o series a listas serializables."""
     if value is None:
         return []
 
@@ -215,9 +232,7 @@ def _to_list(value: Any) -> list:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    """
-    Convierte valores a float evitando NaN e infinitos.
-    """
+    """Convierte valores a float evitando NaN e infinitos."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -230,16 +245,27 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    """
-    Convierte valores a int de forma segura.
-    """
+    """Convierte valores a int de forma segura."""
     return int(round(_safe_float(value, default=default)))
 
 
+def _safe_id_set(values: list[int] | tuple[int] | pd.Series | np.ndarray | None) -> set[int]:
+    """Convierte una colección de ids a set[int]."""
+    if values is None:
+        return set()
+
+    result: set[int] = set()
+
+    for value in values:
+        numeric = pd.to_numeric(value, errors="coerce")
+        if pd.notna(numeric):
+            result.add(int(numeric))
+
+    return result
+
+
 def _clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Limpia espacios en columnas de texto sin convertir NaN en 'nan'.
-    """
+    """Limpia espacios en columnas de texto sin convertir NaN en 'nan'."""
     df = df.copy()
 
     for col in df.select_dtypes(include=["object"]).columns:
@@ -255,9 +281,7 @@ def _validate_columns(
     required_columns: list[str],
     table_name: str,
 ) -> None:
-    """
-    Verifica que una tabla tenga las columnas mínimas esperadas.
-    """
+    """Verifica que una tabla tenga las columnas mínimas esperadas."""
     missing_columns = [col for col in required_columns if col not in df.columns]
 
     if missing_columns:
@@ -270,9 +294,7 @@ def _coerce_numeric_columns(
     df: pd.DataFrame,
     numeric_columns: list[str],
 ) -> pd.DataFrame:
-    """
-    Convierte columnas numéricas existentes y rellena NaN de forma simple.
-    """
+    """Convierte columnas numéricas existentes y rellena NaN de forma simple."""
     df = df.copy()
 
     for col in numeric_columns:
@@ -294,58 +316,86 @@ def _same_team_mask(
     df: pd.DataFrame,
     team_id: int | None,
     team_name: str | None,
+    id_column: str = "team_id",
+    name_column: str = "team",
 ) -> pd.Series:
-    """
-    Máscara flexible para filtrar por equipo.
-    Usa team_id si existe y también compara texto.
-    """
+    """Máscara flexible para filtrar por equipo usando id y/o texto."""
     mask = pd.Series(False, index=df.index)
 
-    if team_id is not None and "team_id" in df.columns:
-        mask = mask | (pd.to_numeric(df["team_id"], errors="coerce") == team_id)
+    if team_id is not None and id_column in df.columns:
+        mask = mask | (pd.to_numeric(df[id_column], errors="coerce") == team_id)
 
-    if team_name is not None and "team" in df.columns:
+    if team_name is not None and name_column in df.columns:
         aliases = _team_aliases(team_name)
-        team_norm = df["team"].astype(str).map(_normalize_text)
+        team_norm = df[name_column].astype(str).map(_normalize_text)
         mask = mask | team_norm.isin(aliases)
 
     return mask
 
 
 # ============================================================
-# 4. PREPARACIÓN RUNTIME
+# 4. CARGA Y PREPARACIÓN RUNTIME
 # ============================================================
 
 
+def _ensure_team_columns_from_latest(players: pd.DataFrame) -> pd.DataFrame:
+    """
+    Asegura columnas team/team_id en perfiles.
+
+    En Fase 3, player_profiles.csv es perfil histórico, pero trae latest_team y
+    latest_team_id para compatibilidad. Usamos esos valores como team/team_id
+    solo para contexto y salida; la pertenencia real al equipo se decide con
+    app_roster.csv.
+    """
+    players = players.copy()
+
+    if "team" not in players.columns and "latest_team" in players.columns:
+        players["team"] = players["latest_team"]
+
+    if "team_id" not in players.columns and "latest_team_id" in players.columns:
+        players["team_id"] = players["latest_team_id"]
+
+    if "team" in players.columns:
+        players["team"] = players["team"].fillna("").astype(str).str.strip()
+
+    if "team_id" in players.columns:
+        players["team_id"] = pd.to_numeric(players["team_id"], errors="coerce").fillna(0)
+        players["team_id"] = players["team_id"].astype(int)
+
+    return players
+
+
 def prepare_runtime_data(
-    players: pd.DataFrame,
+    player_profiles: pd.DataFrame,
     teams: pd.DataFrame,
     matchups: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    app_roster: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     """
-    Ajusta columnas derivadas para conectar los CSV procesados actuales
-    con similarity.py, impact.py y monte_carlo.py.
+    Prepara perfiles, equipos, matchups y app_roster para el recomendador.
 
-    No reemplaza el preprocesamiento.
-    Solo crea columnas auxiliares necesarias en memoria:
-    - expected_minutes
-    - position_group
-    - rim_pressure
-    - columnas per36
-    - aliases ORtg, DRtg, USG
-    - team_id en teams y matchups si falta
-    - net_rating en teams
+    No recalcula el preprocesamiento completo. Solo crea aliases y columnas
+    auxiliares necesarias para similarity.py, impact.py y monte_carlo.py.
     """
-    players = _clean_text_columns(players)
+    players = _clean_text_columns(player_profiles)
     teams = _clean_text_columns(teams)
     matchups = _clean_text_columns(matchups)
+    roster = _clean_text_columns(app_roster) if app_roster is not None else None
+
+    players = _ensure_team_columns_from_latest(players)
 
     players = _coerce_numeric_columns(players, PLAYER_NUMERIC_COLUMNS)
     teams = _coerce_numeric_columns(teams, TEAM_NUMERIC_COLUMNS)
     matchups = _coerce_numeric_columns(matchups, MATCHUP_NUMERIC_COLUMNS)
 
+    if roster is not None:
+        roster = _coerce_numeric_columns(roster, APP_ROSTER_NUMERIC_COLUMNS)
+        roster["player_id"] = pd.to_numeric(roster["player_id"], errors="coerce").fillna(0).astype(int)
+        roster["latest_team"] = roster["latest_team"].fillna("").astype(str).str.strip()
+        roster["player_name"] = roster["player_name"].fillna("").astype(str).str.strip()
+
+    players["player_id"] = pd.to_numeric(players["player_id"], errors="coerce").fillna(0).astype(int)
     players["player_name"] = players["player_name"].fillna("").astype(str).str.strip()
-    players["team"] = players["team"].fillna("").astype(str).str.strip()
     players["position"] = (
         players["position"]
         .fillna("UNK")
@@ -355,21 +405,17 @@ def prepare_runtime_data(
     )
 
     teams["team"] = teams["team"].fillna("").astype(str).str.strip()
-
     matchups["team"] = matchups["team"].fillna("").astype(str).str.strip()
-    matchups["opponent_team"] = (
-        matchups["opponent_team"].fillna("").astype(str).str.strip()
-    )
+    matchups["opponent_team"] = matchups["opponent_team"].fillna("").astype(str).str.strip()
 
-    # En processed_players.csv, minutes ya representa minutos promedio por partido.
+    # En player_profiles.csv, minutes representa minutos promedio por partido.
     # Por eso expected_minutes debe ser igual a minutes.
-    if "expected_minutes" not in players.columns:
-        players["expected_minutes"] = pd.to_numeric(
-            players["minutes"],
-            errors="coerce",
-        ).fillna(24.0)
+    players["expected_minutes"] = pd.to_numeric(
+        players.get("minutes", 24.0),
+        errors="coerce",
+    ).fillna(24.0)
 
-    # role_features.py crea aliases y la feature rim_pressure que similarity.py espera.
+    # role_features.py crea aliases y la feature rim_pressure si hiciera falta.
     players = prepare_players_data(players, overwrite_roles=False)
 
     for col in ["player_id", "team_id", "games_played"]:
@@ -378,12 +424,20 @@ def prepare_runtime_data(
             players[col] = players[col].astype(int)
 
     if "team_id" not in teams.columns:
-        team_id_map = (
-            players.dropna(subset=["team", "team_id"])
-            .groupby("team")["team_id"]
-            .agg(lambda values: values.mode().iloc[0])
-            .to_dict()
-        )
+        if "latest_team_id" in roster.columns if roster is not None else False:
+            team_id_map = (
+                roster.dropna(subset=["latest_team", "latest_team_id"])
+                .groupby("latest_team")["latest_team_id"]
+                .agg(lambda values: values.mode().iloc[0])
+                .to_dict()
+            )
+        else:
+            team_id_map = (
+                players.dropna(subset=["team", "team_id"])
+                .groupby("team")["team_id"]
+                .agg(lambda values: values.mode().iloc[0])
+                .to_dict()
+            )
 
         teams["team_id"] = teams["team"].map(team_id_map)
 
@@ -391,7 +445,7 @@ def prepare_runtime_data(
     missing_team_id = teams["team_id"].isna()
 
     if missing_team_id.any():
-        max_existing_id = pd.to_numeric(players["team_id"], errors="coerce").max()
+        max_existing_id = pd.to_numeric(players.get("team_id", pd.Series([0])), errors="coerce").max()
 
         if pd.isna(max_existing_id):
             max_existing_id = 0
@@ -405,11 +459,7 @@ def prepare_runtime_data(
         teams.loc[missing_team_id, "team_id"] = fallback_ids
 
     teams["team_id"] = teams["team_id"].astype(int)
-
-    teams["net_rating"] = pd.to_numeric(
-        teams["offensive_rating"], errors="coerce"
-    ).fillna(0) - pd.to_numeric(teams["defensive_rating"], errors="coerce").fillna(0)
-
+    teams["net_rating"] = pd.to_numeric(teams["offensive_rating"], errors="coerce").fillna(0) - pd.to_numeric(teams["defensive_rating"], errors="coerce").fillna(0)
     teams["ORtg"] = teams["offensive_rating"]
     teams["DRtg"] = teams["defensive_rating"]
 
@@ -422,64 +472,82 @@ def prepare_runtime_data(
         matchups["opponent_team_id"] = matchups["opponent_team"].map(team_to_id)
 
     matchups["team_id"] = pd.to_numeric(matchups["team_id"], errors="coerce")
-    matchups["opponent_team_id"] = pd.to_numeric(
-        matchups["opponent_team_id"],
-        errors="coerce",
+    matchups["opponent_team_id"] = pd.to_numeric(matchups["opponent_team_id"], errors="coerce")
+
+    return players, teams, matchups, roster
+
+
+def load_recommendation_data(
+    processed_dir: str | Path = "data/processed",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Carga los archivos correctos para Fase 3.
+
+    Fuentes principales:
+    - player_profiles.csv: perfil histórico para similitud, impacto y ranking.
+    - app_roster.csv: pertenencia al equipo seleccionable y banca.
+    - processed_teams.csv: contexto de equipo.
+    - processed_matchups.csv: contexto de matchups.
+    """
+    processed_dir = Path(processed_dir)
+
+    profiles_path = processed_dir / "player_profiles.csv"
+    app_roster_path = processed_dir / "app_roster.csv"
+    teams_path = processed_dir / "processed_teams.csv"
+    matchups_path = processed_dir / "processed_matchups.csv"
+
+    missing = [
+        str(path)
+        for path in [profiles_path, app_roster_path, teams_path, matchups_path]
+        if not path.exists()
+    ]
+
+    if missing:
+        raise FileNotFoundError(
+            "Faltan archivos procesados para Fase 3. "
+            f"Archivos faltantes: {missing}. "
+            "Ejecuta primero: python src/preprocessing.py"
+        )
+
+    player_profiles = pd.read_csv(profiles_path)
+    app_roster = pd.read_csv(app_roster_path)
+    teams = pd.read_csv(teams_path)
+    matchups = pd.read_csv(matchups_path)
+
+    _validate_columns(player_profiles, PLAYER_PROFILE_REQUIRED_COLUMNS, "player_profiles.csv")
+    _validate_columns(app_roster, APP_ROSTER_REQUIRED_COLUMNS, "app_roster.csv")
+    _validate_columns(teams, TEAM_REQUIRED_COLUMNS, "processed_teams.csv")
+    _validate_columns(matchups, MATCHUP_REQUIRED_COLUMNS, "processed_matchups.csv")
+
+    player_profiles, teams, matchups, app_roster = prepare_runtime_data(
+        player_profiles=player_profiles,
+        teams=teams,
+        matchups=matchups,
+        app_roster=app_roster,
     )
 
-    return players, teams, matchups
+    if app_roster is None:
+        raise ValueError("app_roster.csv no pudo cargarse correctamente.")
 
-
-# ============================================================
-# 5. CARGA DE DATOS
-# ============================================================
+    return player_profiles, teams, matchups, app_roster
 
 
 def load_processed_data(
     processed_dir: str | Path = "data/processed",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Carga y valida los tres archivos procesados.
+    Compatibilidad temporal con app.py actual.
 
-    Archivos esperados:
-    - processed_players.csv
-    - processed_teams.csv
-    - processed_matchups.csv
+    Devuelve player_profiles como primer DataFrame para que la app antigua pueda
+    cargar datos sin romperse. Para recomendaciones nuevas, usar
+    load_recommendation_data().
     """
-    processed_dir = Path(processed_dir)
-
-    players_path = processed_dir / "processed_players.csv"
-    teams_path = processed_dir / "processed_teams.csv"
-    matchups_path = processed_dir / "processed_matchups.csv"
-
-    if not players_path.exists():
-        raise FileNotFoundError(f"No se encontró: {players_path}")
-
-    if not teams_path.exists():
-        raise FileNotFoundError(f"No se encontró: {teams_path}")
-
-    if not matchups_path.exists():
-        raise FileNotFoundError(f"No se encontró: {matchups_path}")
-
-    players = pd.read_csv(players_path)
-    teams = pd.read_csv(teams_path)
-    matchups = pd.read_csv(matchups_path)
-
-    _validate_columns(players, PLAYER_REQUIRED_COLUMNS, "processed_players.csv")
-    _validate_columns(teams, TEAM_REQUIRED_COLUMNS, "processed_teams.csv")
-    _validate_columns(matchups, MATCHUP_REQUIRED_COLUMNS, "processed_matchups.csv")
-
-    players, teams, matchups = prepare_runtime_data(
-        players=players,
-        teams=teams,
-        matchups=matchups,
-    )
-
-    return players, teams, matchups
+    player_profiles, teams, matchups, _ = load_recommendation_data(processed_dir)
+    return player_profiles, teams, matchups
 
 
 # ============================================================
-# 6. RESOLVER EQUIPO, JUGADOR Y MATCHUP
+# 5. RESOLVER EQUIPO, JUGADOR Y MATCHUP
 # ============================================================
 
 
@@ -487,12 +555,7 @@ def resolve_team_row(
     teams: pd.DataFrame,
     team_value: str | int,
 ) -> pd.Series:
-    """
-    Encuentra un equipo por:
-    - team_id
-    - abreviación: LAL, BOS, etc.
-    - nombre exacto o parcial en la columna team
-    """
+    """Encuentra un equipo por team_id, abreviación, nombre exacto o parcial."""
     value_text = _normalize_text(team_value)
 
     if str(team_value).strip().isdigit() and "team_id" in teams.columns:
@@ -523,64 +586,97 @@ def resolve_team_row(
     )
 
 
-def resolve_player_row(
-    players: pd.DataFrame,
-    player_value: str | int,
-    selected_team_id: Optional[int] = None,
-    selected_team_name: Optional[str] = None,
-) -> pd.Series:
-    """
-    Encuentra al jugador a reemplazar por:
-    - player_id
-    - player_name exacto
-    - player_name parcial
-
-    Primero busca dentro del equipo seleccionado.
-    """
-    search_space = players.copy()
-
-    team_mask = _same_team_mask(
-        search_space,
+def get_app_roster_for_team(
+    app_roster: pd.DataFrame,
+    selected_team_id: Optional[int],
+    selected_team_name: str,
+) -> pd.DataFrame:
+    """Devuelve roster usable para la app de un equipo seleccionado."""
+    mask = _same_team_mask(
+        app_roster,
         team_id=selected_team_id,
         team_name=selected_team_name,
+        id_column="latest_team_id",
+        name_column="latest_team",
     )
 
-    if team_mask.any():
-        search_space = search_space[team_mask].copy()
+    roster = app_roster[mask].copy()
 
+    if roster.empty:
+        available = (
+            app_roster["latest_team"].dropna().astype(str).drop_duplicates().sort_values().head(30).to_list()
+        )
+        raise ValueError(
+            f"No hay jugadores en app_roster.csv para el equipo seleccionado: "
+            f"{selected_team_name}. Equipos disponibles, muestra: {available}"
+        )
+
+    return roster.reset_index(drop=True)
+
+
+def get_profiles_for_player_ids(
+    player_profiles: pd.DataFrame,
+    player_ids: set[int] | list[int],
+) -> pd.DataFrame:
+    """Devuelve perfiles históricos para una lista/set de player_id."""
+    ids = _safe_id_set(list(player_ids))
+    return player_profiles[player_profiles["player_id"].isin(ids)].copy()
+
+
+def resolve_player_profile_by_id(
+    player_profiles: pd.DataFrame,
+    player_id: int,
+) -> pd.Series:
+    """Encuentra perfil histórico de un jugador por player_id."""
+    player_id = _safe_int(player_id, default=-1)
+    match = player_profiles[player_profiles["player_id"] == player_id]
+
+    if match.empty:
+        raise ValueError(
+            f"No se encontró perfil histórico para player_id={player_id} "
+            "en player_profiles.csv."
+        )
+
+    return match.iloc[0]
+
+
+def resolve_player_id_from_value(
+    player_profiles: pd.DataFrame,
+    current_roster: pd.DataFrame,
+    player_value: str | int,
+) -> int:
+    """
+    Compatibilidad temporal: resuelve un jugador por id o nombre dentro del roster.
+
+    La Fase 3 debe usar replaced_player_id, pero esta función permite migración.
+    """
     if str(player_value).strip().isdigit():
-        player_id = int(player_value)
-        match = search_space[
-            pd.to_numeric(search_space["player_id"], errors="coerce") == player_id
-        ]
-
-        if not match.empty:
-            return match.iloc[0]
+        candidate_id = int(player_value)
+        if candidate_id in set(current_roster["player_id"].astype(int)):
+            return candidate_id
 
     value_text = _normalize_text(player_value)
-    player_text = search_space["player_name"].astype(str).map(_normalize_text)
 
-    exact = search_space[player_text == value_text]
+    roster_text = current_roster["player_name"].astype(str).map(_normalize_text)
+    exact_roster = current_roster[roster_text == value_text]
 
-    if not exact.empty:
-        return exact.iloc[0]
+    if not exact_roster.empty:
+        return int(exact_roster.iloc[0]["player_id"])
 
-    partial = search_space[player_text.str.contains(value_text, na=False, regex=False)]
+    partial_roster = current_roster[roster_text.str.contains(value_text, na=False, regex=False)]
 
-    if not partial.empty:
-        return partial.iloc[0]
+    if not partial_roster.empty:
+        return int(partial_roster.iloc[0]["player_id"])
 
-    available_players = (
-        search_space[["player_name", "team"]]
-        .drop_duplicates()
-        .head(30)
-        .to_dict(orient="records")
-    )
+    profile_text = player_profiles["player_name"].astype(str).map(_normalize_text)
+    exact_profile = player_profiles[profile_text == value_text]
+
+    if not exact_profile.empty:
+        return int(exact_profile.iloc[0]["player_id"])
 
     raise ValueError(
-        f"No se encontró el jugador: {player_value}. "
-        f"Jugadores disponibles en el espacio de búsqueda, muestra: "
-        f"{available_players}"
+        f"No se pudo resolver el jugador a reemplazar: {player_value}. "
+        "En Fase 3 se recomienda pasar replaced_player_id explícitamente."
     )
 
 
@@ -589,19 +685,11 @@ def resolve_matchup_row(
     opponent_team_id: Optional[int],
     opponent_team_name: str,
 ) -> pd.Series:
-    """
-    Busca una fila de processed_matchups.csv asociada al rival.
-
-    El matchup actual no trae perfil defensivo agregado; por ahora usamos
-    cualquier fila histórica del rival como ancla para construir contexto
-    neutral si no hay jugadores del rival disponibles.
-    """
+    """Busca una fila de processed_matchups.csv asociada al rival."""
     candidates = matchups.copy()
 
     if opponent_team_id is not None and "team_id" in candidates.columns:
-        by_id = candidates[
-            pd.to_numeric(candidates["team_id"], errors="coerce") == opponent_team_id
-        ]
+        by_id = candidates[pd.to_numeric(candidates["team_id"], errors="coerce") == opponent_team_id]
 
         if not by_id.empty:
             return by_id.iloc[0]
@@ -614,9 +702,7 @@ def resolve_matchup_row(
     if not by_team.empty:
         return by_team.iloc[0]
 
-    available_matchup_teams = (
-        candidates["team"].dropna().drop_duplicates().head(30).to_list()
-    )
+    available_matchup_teams = candidates["team"].dropna().drop_duplicates().head(30).to_list()
 
     raise ValueError(
         f"No se encontró matchup para el rival: {opponent_team_name}. "
@@ -624,162 +710,133 @@ def resolve_matchup_row(
     )
 
 
-def get_team_players(
-    players: pd.DataFrame,
-    team_id: Optional[int],
-    team_name: str,
-) -> pd.DataFrame:
-    """
-    Devuelve jugadores de un equipo usando team_id y/o texto.
-    """
-    mask = _same_team_mask(players, team_id=team_id, team_name=team_name)
-
-    return players[mask].copy()
-
-
 # ============================================================
-# 7. FILTRO Y DEDUPLICACIÓN DE CANDIDATOS
+# 6. VALIDACIÓN DE LINEUP Y CANDIDATOS DE BANCA
 # ============================================================
 
 
-def build_player_deduplication_key(row: pd.Series) -> str:
-    """
-    Construye una llave estable para identificar jugadores únicos.
+def validate_lineup_inputs(
+    lineup_player_ids: list[int] | tuple[int] | pd.Series | np.ndarray | None,
+    replaced_player_id: int,
+    current_roster: pd.DataFrame,
+    selected_team_name: str,
+) -> set[int]:
+    """Valida quinteta, reemplazado y pertenencia al equipo en app_roster.csv."""
+    lineup_ids = _safe_id_set(lineup_player_ids)
 
-    Prioridad:
-    1. player_id válido.
-    2. player_name normalizado como respaldo.
-    """
-    player_id = pd.to_numeric(row.get("player_id"), errors="coerce")
-
-    if pd.notna(player_id) and int(player_id) > 0:
-        return f"id:{int(player_id)}"
-
-    player_name = _normalize_text(row.get("player_name", ""))
-
-    return f"name:{player_name}"
-
-
-def deduplicate_candidate_players(candidates: pd.DataFrame) -> pd.DataFrame:
-    """
-    Elimina duplicados de jugador en candidatos.
-
-    Decisión de diseño:
-    - Si player_id existe, deduplicamos por player_id.
-    - Si player_id falta o no es válido, deduplicamos por player_name.
-    - Nos quedamos con la fila más representativa:
-        1. mayor games_played
-        2. mayor minutes
-        3. mayor points
-    """
-    if candidates.empty:
-        return candidates.reset_index(drop=True)
-
-    candidates = candidates.copy()
-
-    candidates["_dedupe_key"] = candidates.apply(
-        build_player_deduplication_key,
-        axis=1,
-    )
-
-    candidates["_sort_games_played"] = pd.to_numeric(
-        candidates.get("games_played", 0),
-        errors="coerce",
-    ).fillna(0)
-
-    candidates["_sort_minutes"] = pd.to_numeric(
-        candidates.get("minutes", 0),
-        errors="coerce",
-    ).fillna(0)
-
-    candidates["_sort_points"] = pd.to_numeric(
-        candidates.get("points", 0),
-        errors="coerce",
-    ).fillna(0)
-
-    candidates = candidates.sort_values(
-        by=[
-            "_dedupe_key",
-            "_sort_games_played",
-            "_sort_minutes",
-            "_sort_points",
-        ],
-        ascending=[True, False, False, False],
-    )
-
-    candidates = candidates.drop_duplicates(
-        subset=["_dedupe_key"],
-        keep="first",
-    )
-
-    candidates = candidates.drop(
-        columns=[
-            "_dedupe_key",
-            "_sort_games_played",
-            "_sort_minutes",
-            "_sort_points",
-        ],
-        errors="ignore",
-    )
-
-    return candidates.reset_index(drop=True)
-
-
-def filter_candidates(
-    players: pd.DataFrame,
-    replaced_player: pd.Series,
-    opponent_team_id: Optional[int],
-    opponent_team_name: Optional[str],
-    min_minutes: Optional[float] = 10.0,
-    min_games: Optional[int] = 10,
-    exclude_opponent_players: bool = True,
-    deduplicate_players: bool = True,
-) -> pd.DataFrame:
-    """
-    Filtra candidatos válidos.
-
-    Reglas:
-    - excluye al jugador reemplazado
-    - opcionalmente excluye jugadores del rival
-    - opcionalmente filtra por minutos mínimos
-    - opcionalmente filtra por partidos mínimos
-    - opcionalmente elimina duplicados de jugador
-    """
-    candidates = players.copy()
-
-    replaced_player_id = _safe_int(replaced_player.get("player_id", -1), default=-1)
-
-    candidates = candidates[
-        pd.to_numeric(candidates["player_id"], errors="coerce") != replaced_player_id
-    ]
-
-    if exclude_opponent_players:
-        opponent_mask = _same_team_mask(
-            candidates,
-            team_id=opponent_team_id,
-            team_name=opponent_team_name,
+    if len(lineup_ids) != 5:
+        raise ValueError(
+            "lineup_player_ids debe contener exactamente 5 jugadores únicos. "
+            f"Recibidos: {len(lineup_ids)}."
         )
 
-        candidates = candidates[~opponent_mask]
+    replaced_player_id = _safe_int(replaced_player_id, default=-1)
+
+    if replaced_player_id not in lineup_ids:
+        raise ValueError(
+            f"El replaced_player_id={replaced_player_id} debe estar dentro de "
+            "lineup_player_ids."
+        )
+
+    roster_ids = set(current_roster["player_id"].astype(int).tolist())
+    missing_from_roster = sorted(lineup_ids - roster_ids)
+
+    if missing_from_roster:
+        roster_preview = (
+            current_roster[["player_id", "player_name", "latest_team"]]
+            .head(15)
+            .to_dict(orient="records")
+        )
+        raise ValueError(
+            f"Estos player_id de la quinteta no pertenecen a {selected_team_name} "
+            f"según app_roster.csv: {missing_from_roster}. "
+            f"Muestra del roster válido: {roster_preview}"
+        )
+
+    return lineup_ids
+
+
+def build_bench_candidates(
+    player_profiles: pd.DataFrame,
+    app_roster: pd.DataFrame,
+    selected_team_id: Optional[int],
+    selected_team_name: str,
+    lineup_player_ids: set[int],
+    replaced_player_id: int,
+    min_minutes: Optional[float] = 10.0,
+    min_games: Optional[int] = 10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Construye candidatos desde la banca del mismo equipo ANTES de rankear.
+
+    Reglas:
+    - mismo equipo seleccionado en app_roster.csv
+    - fuera de lineup_player_ids
+    - distinto al jugador reemplazado
+    - existente en player_profiles.csv
+    - cumple min_games y min_minutes
+    """
+    current_roster = get_app_roster_for_team(
+        app_roster=app_roster,
+        selected_team_id=selected_team_id,
+        selected_team_name=selected_team_name,
+    )
+
+    roster_ids = set(current_roster["player_id"].astype(int).tolist())
+    bench_ids = roster_ids - set(lineup_player_ids)
+    bench_ids.discard(_safe_int(replaced_player_id, default=-1))
+
+    if not bench_ids:
+        raise ValueError(
+            f"No hay jugadores de banca disponibles para {selected_team_name} "
+            "después de excluir la quinteta."
+        )
+
+    candidates = player_profiles[player_profiles["player_id"].isin(bench_ids)].copy()
+
+    if candidates.empty:
+        raise ValueError(
+            f"La banca de {selected_team_name} no tiene perfiles históricos "
+            "disponibles en player_profiles.csv."
+        )
+
+    # Adjuntamos metadata de app_roster para salida y validación.
+    roster_metadata_cols = [
+        "player_id",
+        "latest_team_id",
+        "latest_team",
+        "latest_season",
+        "latest_game_date",
+    ]
+    roster_metadata_cols = [col for col in roster_metadata_cols if col in current_roster.columns]
+
+    candidates = candidates.merge(
+        current_roster[roster_metadata_cols].drop_duplicates(subset=["player_id"]),
+        on="player_id",
+        how="left",
+        suffixes=("", "_app"),
+    )
+
+    candidates = candidates[candidates["player_id"] != _safe_int(replaced_player_id, default=-1)]
 
     if min_minutes is not None:
-        candidates = candidates[
-            pd.to_numeric(candidates["minutes"], errors="coerce") >= float(min_minutes)
-        ]
+        candidates = candidates[pd.to_numeric(candidates["minutes"], errors="coerce") >= float(min_minutes)]
 
     if min_games is not None:
-        candidates = candidates[
-            pd.to_numeric(candidates["games_played"], errors="coerce") >= int(min_games)
-        ]
+        candidates = candidates[pd.to_numeric(candidates["games_played"], errors="coerce") >= int(min_games)]
 
-    if deduplicate_players:
-        candidates = deduplicate_candidate_players(candidates)
+    if candidates.empty:
+        raise ValueError(
+            "No hay candidatos válidos en la banca después de aplicar filtros. "
+            f"Equipo={selected_team_name}, min_games={min_games}, "
+            f"min_minutes={min_minutes}. Prueba bajar los filtros."
+        )
 
-    return candidates.reset_index(drop=True)
+    return candidates.reset_index(drop=True), current_roster.reset_index(drop=True)
 
 
 # ============================================================
-# 8. SCORING E IMPACTO
+# 7. SCORING E IMPACTO
 # ============================================================
 
 
@@ -793,73 +850,11 @@ def score_candidate(
     opponent_context: Optional[dict[str, float]] = None,
 ) -> dict:
     """
-    Calcula las métricas de un candidato usando las funciones reales:
-
-    - similarity.calculate_replacement_score()
-    - impact.estimate_player_impact()
+    Calcula métricas de un candidato usando similarity.py e impact.py.
     """
-    replaced_dict = _to_dict(replaced_player)
-    candidate_dict = _to_dict(candidate)
-    selected_team_dict = _to_dict(selected_team)
+    _ = opponent_team
+    _ = opponent_matchup
 
-    score_data = similarity.calculate_replacement_score(
-        replaced_player=replaced_dict,
-        candidate=candidate_dict,
-        team_need=team_need,
-        opponent_context=opponent_context,
-    )
-
-
-def score_candidate(
-    candidate: pd.Series,
-    replaced_player: pd.Series,
-    selected_team: pd.Series,
-    opponent_team: pd.Series,
-    opponent_matchup: pd.Series,
-    team_need: Optional[dict[str, float]] = None,
-    opponent_context: Optional[dict[str, float]] = None,
-) -> dict:
-    """
-    Calcula las métricas de un candidato usando las funciones reales:
-
-    - similarity.calculate_replacement_score()
-    - impact.estimate_player_impact()
-
-    Punto 2:
-    El impacto ahora es relativo:
-        impact(candidate) - impact(replaced_player)
-    """
-    replaced_dict = _to_dict(replaced_player)
-    candidate_dict = _to_dict(candidate)
-    selected_team_dict = _to_dict(selected_team)
-
-    score_data = similarity.calculate_replacement_score(
-        replaced_player=replaced_dict,
-        candidate=candidate_dict,
-        team_need=team_need,
-        opponent_context=opponent_context,
-    )
-
-
-def score_candidate(
-    candidate: pd.Series,
-    replaced_player: pd.Series,
-    selected_team: pd.Series,
-    opponent_team: pd.Series,
-    opponent_matchup: pd.Series,
-    team_need: Optional[dict[str, float]] = None,
-    opponent_context: Optional[dict[str, float]] = None,
-) -> dict:
-    """
-    Calcula las métricas de un candidato usando las funciones reales:
-
-    - similarity.calculate_replacement_score()
-    - impact.estimate_player_impact()
-
-    Punto 2:
-    El impacto ahora es relativo:
-        impact(candidate) - impact(replaced_player)
-    """
     replaced_dict = _to_dict(replaced_player)
     candidate_dict = _to_dict(candidate)
     selected_team_dict = _to_dict(selected_team)
@@ -878,21 +873,27 @@ def score_candidate(
         team_context=selected_team_dict,
     )
 
+    latest_team_value = candidate.get("latest_team", candidate.get("team", ""))
+    latest_team_id_value = candidate.get("latest_team_id", candidate.get("team_id", 0))
+
     return {
         "player_id": _safe_int(candidate.get("player_id")),
         "player_name": str(candidate.get("player_name", "")),
         "team_id": _safe_int(candidate.get("team_id")),
         "team": str(candidate.get("team", "")),
+        "latest_team_id": _safe_int(latest_team_id_value),
+        "latest_team": str(latest_team_value),
         "position": str(candidate.get("position", "")),
         "position_group": str(candidate.get("position_group", "")),
-        "minutes": _safe_float(candidate.get("minutes")),
         "games_played": _safe_int(candidate.get("games_played")),
+        "minutes": _safe_float(candidate.get("minutes")),
         "points": _safe_float(candidate.get("points")),
         "role_similarity": _safe_float(score_data.get("role_similarity")),
         "position_fit": _safe_float(score_data.get("position_fit")),
         "team_fit": _safe_float(score_data.get("team_fit")),
         "opponent_fit": _safe_float(score_data.get("opponent_fit")),
         "replacement_score": _safe_float(score_data.get("final_score")),
+        "recommendation_score": _safe_float(score_data.get("final_score")),
         "offensive_impact": _safe_float(impact_data.get("offensive_impact")),
         "defensive_impact": _safe_float(impact_data.get("defensive_impact")),
         "pace_impact": _safe_float(impact_data.get("pace_impact")),
@@ -906,64 +907,11 @@ def score_candidate(
         "fit_multiplier": _safe_float(impact_data.get("fit_multiplier")),
         "comparison_minutes": _safe_float(impact_data.get("comparison_minutes")),
         "cap_applied": bool(impact_data.get("cap_applied", False)),
-    }
-
-    return {
-        "player_id": _safe_int(candidate.get("player_id")),
-        "player_name": str(candidate.get("player_name", "")),
-        "team_id": _safe_int(candidate.get("team_id")),
-        "team": str(candidate.get("team", "")),
-        "position": str(candidate.get("position", "")),
-        "position_group": str(candidate.get("position_group", "")),
-        "minutes": _safe_float(candidate.get("minutes")),
-        "games_played": _safe_int(candidate.get("games_played")),
-        "points": _safe_float(candidate.get("points")),
-        "role_similarity": _safe_float(score_data.get("role_similarity")),
-        "position_fit": _safe_float(score_data.get("position_fit")),
-        "team_fit": _safe_float(score_data.get("team_fit")),
-        "opponent_fit": _safe_float(score_data.get("opponent_fit")),
-        "replacement_score": _safe_float(score_data.get("final_score")),
-        "offensive_impact": _safe_float(impact_data.get("offensive_impact")),
-        "defensive_impact": _safe_float(impact_data.get("defensive_impact")),
-        "pace_impact": _safe_float(impact_data.get("pace_impact")),
-        "estimated_net_impact": _safe_float(
-            impact_data.get("estimated_net_impact", impact_data.get("net_impact"))
-        ),
-        "candidate_value": _safe_float(impact_data.get("candidate_value")),
-        "replaced_value": _safe_float(impact_data.get("replaced_value")),
-        "raw_net_delta": _safe_float(impact_data.get("raw_net_delta")),
-        "impact_mode": str(impact_data.get("impact_mode", "relative")),
-        "fit_multiplier": _safe_float(impact_data.get("fit_multiplier")),
-        "comparison_minutes": _safe_float(impact_data.get("comparison_minutes")),
-        "cap_applied": bool(impact_data.get("cap_applied", False)),
-    }
-
-    return {
-        "player_id": _safe_int(candidate.get("player_id")),
-        "player_name": str(candidate.get("player_name", "")),
-        "team_id": _safe_int(candidate.get("team_id")),
-        "team": str(candidate.get("team", "")),
-        "position": str(candidate.get("position", "")),
-        "position_group": str(candidate.get("position_group", "")),
-        "minutes": _safe_float(candidate.get("minutes")),
-        "games_played": _safe_int(candidate.get("games_played")),
-        "points": _safe_float(candidate.get("points")),
-        "role_similarity": _safe_float(score_data.get("role_similarity")),
-        "position_fit": _safe_float(score_data.get("position_fit")),
-        "team_fit": _safe_float(score_data.get("team_fit")),
-        "opponent_fit": _safe_float(score_data.get("opponent_fit")),
-        "replacement_score": _safe_float(score_data.get("final_score")),
-        "offensive_impact": _safe_float(impact_data.get("offensive_impact")),
-        "defensive_impact": _safe_float(impact_data.get("defensive_impact")),
-        "pace_impact": _safe_float(impact_data.get("pace_impact")),
-        "estimated_net_impact": _safe_float(
-            impact_data.get("estimated_net_impact", impact_data.get("net_impact"))
-        ),
     }
 
 
 # ============================================================
-# 9. MONTE CARLO
+# 8. MONTE CARLO
 # ============================================================
 
 
@@ -974,12 +922,7 @@ def simulate_replacement(
     num_simulations: int,
     use_baseline: bool = False,
 ) -> dict:
-    """
-    Ejecuta Monte Carlo con monte_carlo.monte_carlo_replacement_analysis().
-
-    Si use_baseline=True, devuelve el escenario sin reemplazo.
-    Si use_baseline=False, devuelve el escenario con reemplazo.
-    """
+    """Ejecuta Monte Carlo con monte_carlo.monte_carlo_replacement_analysis()."""
     raw_result = monte_carlo.monte_carlo_replacement_analysis(
         team_context=_to_dict(selected_team),
         opponent_context=_to_dict(opponent_team),
@@ -988,9 +931,7 @@ def simulate_replacement(
     )
 
     scenario_key = "without_replacement" if use_baseline else "with_replacement"
-    probability_key = (
-        "win_probability_without" if use_baseline else "win_probability_with"
-    )
+    probability_key = "win_probability_without" if use_baseline else "win_probability_with"
 
     scenario = raw_result.get(scenario_key, {})
 
@@ -998,9 +939,7 @@ def simulate_replacement(
         "win_probability": _safe_float(raw_result.get(probability_key)),
         "expected_margin": _safe_float(scenario.get("expected_margin")),
         "expected_team_points": _safe_float(scenario.get("expected_team_points")),
-        "expected_opponent_points": _safe_float(
-            scenario.get("expected_opponent_points")
-        ),
+        "expected_opponent_points": _safe_float(scenario.get("expected_opponent_points")),
         "margins": _to_list(scenario.get("margins")),
         "team_scores": _to_list(scenario.get("team_scores")),
         "opponent_scores": _to_list(scenario.get("opponent_scores")),
@@ -1009,7 +948,7 @@ def simulate_replacement(
 
 
 # ============================================================
-# 10. EXPLICACIONES
+# 9. EXPLICACIONES
 # ============================================================
 
 
@@ -1017,12 +956,7 @@ def build_candidate_explanation(
     candidate_result: dict,
     candidate_simulation: dict,
 ) -> str:
-    """
-    Construye explicación individual para un candidato.
-
-    Nota:
-    Los impactos ya son diferenciales respecto al jugador reemplazado.
-    """
+    """Construye explicación individual para un candidato."""
     score_data = {
         "final_score": candidate_result.get("replacement_score", 0.0),
         "role_similarity": candidate_result.get("role_similarity", 0.0),
@@ -1060,9 +994,7 @@ def build_text_explanation(
     top_replacements: list[dict],
     baseline_win_probability: float,
 ) -> str:
-    """
-    Construye explicación global del ranking.
-    """
+    """Construye explicación global del ranking."""
     summary_ready = []
 
     for result in top_replacements:
@@ -1087,15 +1019,18 @@ def build_text_explanation(
 
 
 # ============================================================
-# 11. FLUJO PRINCIPAL DEL RECOMENDADOR
+# 10. FLUJO PRINCIPAL DEL RECOMENDADOR
 # ============================================================
 
 
 def recommend_replacements(
     selected_team_value: str | int,
-    player_to_replace_value: str | int,
     opponent_team_value: str | int,
+    lineup_player_ids: list[int] | tuple[int] | pd.Series | np.ndarray | None = None,
+    replaced_player_id: int | None = None,
+    player_to_replace_value: str | int | None = None,
     num_simulations: int = 1000,
+    monte_carlo_simulations: int | None = None,
     processed_dir: str | Path = "data/processed",
     top_n: int = 3,
     min_minutes: Optional[float] = 10.0,
@@ -1104,11 +1039,18 @@ def recommend_replacements(
     random_state: Optional[int] = 42,
 ) -> dict:
     """
-    Flujo completo del recomendador.
+    Flujo completo del recomendador para Fase 3.
+
+    app_roster.csv decide pertenencia al roster usable y banca.
+    player_profiles.csv decide el perfil estadístico usado para ranking.
     """
+    _ = exclude_opponent_players  # Se conserva por compatibilidad, pero ya no define la banca.
     _ = random_state  # Monte Carlo actual usa semillas internas fijas.
 
-    players, teams, matchups = load_processed_data(processed_dir)
+    if monte_carlo_simulations is not None:
+        num_simulations = int(monte_carlo_simulations)
+
+    player_profiles, teams, matchups, app_roster = load_recommendation_data(processed_dir)
 
     selected_team = resolve_team_row(
         teams=teams,
@@ -1126,11 +1068,36 @@ def recommend_replacements(
     selected_team_name = str(selected_team.get("team", ""))
     opponent_team_name = str(opponent_team.get("team", ""))
 
-    replaced_player = resolve_player_row(
-        players=players,
-        player_value=player_to_replace_value,
+    current_roster = get_app_roster_for_team(
+        app_roster=app_roster,
         selected_team_id=selected_team_id,
         selected_team_name=selected_team_name,
+    )
+
+    if replaced_player_id is None:
+        if player_to_replace_value is None:
+            raise ValueError(
+                "Debes pasar replaced_player_id. "
+                "Compatibilidad temporal: también puedes pasar player_to_replace_value."
+            )
+        replaced_player_id = resolve_player_id_from_value(
+            player_profiles=player_profiles,
+            current_roster=current_roster,
+            player_value=player_to_replace_value,
+        )
+
+    replaced_player_id = _safe_int(replaced_player_id, default=-1)
+
+    lineup_ids = validate_lineup_inputs(
+        lineup_player_ids=lineup_player_ids,
+        replaced_player_id=replaced_player_id,
+        current_roster=current_roster,
+        selected_team_name=selected_team_name,
+    )
+
+    replaced_player = resolve_player_profile_by_id(
+        player_profiles=player_profiles,
+        player_id=replaced_player_id,
     )
 
     opponent_matchup = resolve_matchup_row(
@@ -1139,16 +1106,32 @@ def recommend_replacements(
         opponent_team_name=opponent_team_name,
     )
 
-    selected_team_players = get_team_players(
-        players=players,
-        team_id=selected_team_id,
-        team_name=selected_team_name,
+    candidates, current_roster = build_bench_candidates(
+        player_profiles=player_profiles,
+        app_roster=app_roster,
+        selected_team_id=selected_team_id,
+        selected_team_name=selected_team_name,
+        lineup_player_ids=lineup_ids,
+        replaced_player_id=replaced_player_id,
+        min_minutes=min_minutes,
+        min_games=min_games,
     )
 
-    opponent_players = get_team_players(
-        players=players,
-        team_id=opponent_team_id,
-        team_name=opponent_team_name,
+    selected_roster_profile_ids = set(current_roster["player_id"].astype(int).tolist())
+    selected_team_players = get_profiles_for_player_ids(
+        player_profiles=player_profiles,
+        player_ids=selected_roster_profile_ids,
+    )
+
+    opponent_roster = get_app_roster_for_team(
+        app_roster=app_roster,
+        selected_team_id=opponent_team_id,
+        selected_team_name=opponent_team_name,
+    )
+
+    opponent_players = get_profiles_for_player_ids(
+        player_profiles=player_profiles,
+        player_ids=set(opponent_roster["player_id"].astype(int).tolist()),
     )
 
     if not selected_team_players.empty:
@@ -1157,30 +1140,9 @@ def recommend_replacements(
         team_need = None
 
     if not opponent_players.empty:
-        opponent_context = similarity.build_opponent_context_from_players(
-            opponent_players
-        )
+        opponent_context = similarity.build_opponent_context_from_players(opponent_players)
     else:
-        opponent_context = similarity.build_opponent_context_from_matchup(
-            _to_dict(opponent_matchup)
-        )
-
-    candidates = filter_candidates(
-        players=players,
-        replaced_player=replaced_player,
-        opponent_team_id=opponent_team_id,
-        opponent_team_name=opponent_team_name,
-        min_minutes=min_minutes,
-        min_games=min_games,
-        exclude_opponent_players=exclude_opponent_players,
-        deduplicate_players=True,
-    )
-
-    if candidates.empty:
-        raise ValueError(
-            "No hay candidatos válidos después de aplicar los filtros. "
-            "Prueba bajar min_minutes o min_games."
-        )
+        opponent_context = similarity.build_opponent_context_from_matchup(_to_dict(opponent_matchup))
 
     zero_impact = {
         "offensive_impact": 0.0,
@@ -1229,25 +1191,16 @@ def recommend_replacements(
             use_baseline=False,
         )
 
-        candidate_result["win_probability_with_replacement"] = candidate_simulation[
-            "win_probability"
-        ]
-
+        candidate_result["win_probability_with_replacement"] = candidate_simulation["win_probability"]
         candidate_result["win_probability_delta"] = (
-            candidate_result["win_probability_with_replacement"]
-            - baseline_win_probability
+            candidate_result["win_probability_with_replacement"] - baseline_win_probability
         )
-
-        candidate_result["expected_margin_with_replacement"] = candidate_simulation[
-            "expected_margin"
-        ]
-
+        candidate_result["expected_margin_with_replacement"] = candidate_simulation["expected_margin"]
         candidate_result["simulation_distribution"] = {
             "margins": candidate_simulation["margins"],
             "team_scores": candidate_simulation["team_scores"],
             "opponent_scores": candidate_simulation["opponent_scores"],
         }
-
         candidate_result["explanation"] = build_candidate_explanation(
             candidate_result=candidate_result,
             candidate_simulation=candidate_simulation,
@@ -1258,7 +1211,7 @@ def recommend_replacements(
     results_df = pd.DataFrame(scored_candidates)
 
     if results_df.empty:
-        raise ValueError("No se pudo calcular score para ningún candidato.")
+        raise ValueError("No se pudo calcular score para ningún candidato de banca.")
 
     results_df = results_df.sort_values(
         by=[
@@ -1279,16 +1232,27 @@ def recommend_replacements(
         baseline_win_probability=baseline_win_probability,
     )
 
+    current_roster_ids = set(current_roster["player_id"].astype(int).tolist())
+    bench_ids_before_filters = sorted(current_roster_ids - lineup_ids - {replaced_player_id})
+
     return {
         "selected_team": _to_dict(selected_team),
         "opponent_team": _to_dict(opponent_team),
         "replaced_player": _to_dict(replaced_player),
+        "replaced_player_id": replaced_player_id,
+        "lineup_player_ids": sorted(lineup_ids),
         "num_simulations": num_simulations,
         "filters": {
             "min_minutes": min_minutes,
             "min_games": min_games,
-            "exclude_opponent_players": exclude_opponent_players,
-            "deduplicate_players": True,
+            "source_roster": "app_roster.csv",
+            "source_profiles": "player_profiles.csv",
+            "candidate_rule": "same_team_bench_before_ranking",
+        },
+        "roster_debug": {
+            "current_roster_size": len(current_roster),
+            "bench_size_before_filters": len(bench_ids_before_filters),
+            "candidate_size_after_filters": len(candidates),
         },
         "contexts": {
             "team_need": team_need,
@@ -1296,9 +1260,7 @@ def recommend_replacements(
         },
         "baseline": {
             "win_probability_without_replacement": baseline_win_probability,
-            "expected_margin_without_replacement": baseline_simulation[
-                "expected_margin"
-            ],
+            "expected_margin_without_replacement": baseline_simulation["expected_margin"],
             "simulation_distribution": {
                 "margins": baseline_simulation["margins"],
                 "team_scores": baseline_simulation["team_scores"],
@@ -1312,40 +1274,47 @@ def recommend_replacements(
 
 
 # ============================================================
-# 12. EJEMPLO DE USO DIRECTO
+# 11. EJEMPLO DE USO DIRECTO
 # ============================================================
 
 if __name__ == "__main__":
-    result = recommend_replacements(
-        selected_team_value="LAL",
-        player_to_replace_value="LeBron James",
-        opponent_team_value="BOS",
-        num_simulations=1000,
-        processed_dir="data/processed",
-        top_n=3,
-        min_minutes=10,
-        min_games=10,
-        exclude_opponent_players=True,
-        random_state=42,
-    )
+    # Ejemplo mínimo. Para pruebas completas, usa checks/check_recommender_backend.py.
+    processed_dir = Path("data/processed")
+    player_profiles, _, _, app_roster = load_recommendation_data(processed_dir)
 
-    print("\nProbabilidad sin reemplazo:")
-    print(result["baseline"]["win_probability_without_replacement"])
+    lal = app_roster[app_roster["latest_team"].astype(str).str.upper() == "LAL"].copy()
+    names = [
+        "LeBron James",
+        "Anthony Davis",
+        "Austin Reaves",
+        "Dennis Schroder",
+        "Lonnie Walker IV",
+    ]
 
-    print("\nTop reemplazos:")
+    lineup = []
+    for name in names:
+        row = lal[lal["player_name"].astype(str).str.lower() == name.lower()]
+        if not row.empty:
+            lineup.append(int(row.iloc[0]["player_id"]))
 
-    for i, player in enumerate(result["top_replacements"], start=1):
-        print(f"\n{i}. {player['player_name']} - {player['team']}")
-        print(f"   role_similarity: {player['role_similarity']:.3f}")
-        print(f"   position_fit: {player['position_fit']:.3f}")
-        print(f"   team_fit: {player['team_fit']:.3f}")
-        print(f"   opponent_fit: {player['opponent_fit']:.3f}")
-        print(f"   replacement_score: {player['replacement_score']:.3f}")
-        print(f"   estimated_net_impact: {player['estimated_net_impact']:.3f}")
-        print(
-            "   win_probability_with_replacement: "
-            f"{player['win_probability_with_replacement']:.3f}"
+    if len(lineup) == 5:
+        result = recommend_replacements(
+            selected_team_value="LAL",
+            opponent_team_value="BOS",
+            lineup_player_ids=lineup,
+            replaced_player_id=lineup[0],
+            num_simulations=1000,
+            processed_dir=processed_dir,
+            top_n=3,
+            min_minutes=10,
+            min_games=10,
         )
 
-    print("\nExplicación:")
-    print(result["explanation"])
+        print("Top reemplazos:")
+        for i, player in enumerate(result["top_replacements"], start=1):
+            print(
+                f"{i}. {player['player_name']} - {player['latest_team']} "
+                f"score={player['replacement_score']:.3f}"
+            )
+    else:
+        print("No se pudo construir la quinteta ejemplo de LAL.")
